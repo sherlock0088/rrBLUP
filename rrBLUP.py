@@ -1,6 +1,136 @@
 ################################################################
-#  Update Date: 2023-04-14                         #
+#  Update Date: 2024-09-27                         #
 ################################################################
+import numpy as np
+from sklearn.preprocessing import StandardScaler
+import random
+
+def A_mat_continuous(X, impute_method="mean", tol=0.02, shrink=False, n_qtl=100, n_iter=5, return_imputed=False):
+    '''
+    Calculate the Additive Relationship Matrix (A.mat) for continuous variables.
+    
+    Parameters:
+    -----------
+    X [array]:
+        Matrix of continuous genotype values for n lines (samples) and m markers (features)
+        
+    impute_method [str("mean" or "EM"), default = "mean"]:
+        Method for imputing missing values ("mean" for mean imputation or "EM" for EM algorithm)
+        
+    tol [float, default = 0.02]:
+        Convergence criterion for the EM algorithm
+        
+    shrink [Union[bool, str("EJ" or "REG")], default = False]:
+        Method of shrinkage estimation. "EJ" for Endelman and Jannink (2012) or "REG" for Muller et al. (2015).
+        If True, "EJ" will be used by default.
+        
+    n_qtl [int, default = 100]:
+        Number of simulated QTL for the REG algorithm
+        
+    n_iter [int, default = 5]:
+        Number of iterations for the REG algorithm
+        
+    return_imputed [bool, default = False]:
+        Whether to return the imputed marker matrix along with the relationship matrix
+    
+    Returns:
+    --------
+    A [array]:
+        Additive genomic relationship matrix (n * n)
+        
+    (When return_imputed = True)
+    imputed [array]:
+        Imputed X matrix
+    '''
+    
+    def crossprod(A, B):
+        return np.dot(np.transpose(A), B)
+    
+    def tcrossprod(A, B):
+        return np.dot(A, np.transpose(B))
+    
+    def impute_EM(W, cov_mat, mean_vec):
+        n = W.shape[0]
+        m = W.shape[1]
+        S = np.zeros((n, n))
+        for i in range(m):
+            Wi = W[:, i].reshape(-1, 1)
+            missing_index = np.argwhere(np.isnan(Wi))[:, 0]
+            if len(missing_index) > 0:
+                not_NA = np.setdiff1d(range(n), missing_index)
+                Bt = np.linalg.solve(cov_mat.take(not_NA, 0).take(not_NA, 1), 
+                                     cov_mat.take(not_NA, 0).take(missing_index, 1))
+                Wi[missing_index] = mean_vec[missing_index] + crossprod(Bt, Wi[not_NA] - mean_vec[not_NA])
+                C = cov_mat.take(missing_index, 0).take(missing_index, 1) - crossprod(
+                    cov_mat.take(not_NA, 0).take(missing_index, 1), Bt)
+                D = tcrossprod(Wi, Wi)
+                D[missing_index[:, None], missing_index] += C
+                W[:, i] = Wi.flatten()
+            else:
+                D = tcrossprod(Wi, Wi)
+            S += D
+        W_imp = W
+        return [S, W_imp]
+
+    def shrink_coeff(i, W, n_qtl, p):
+        m = W.shape[1]
+        n = W.shape[0]
+        qtl = np.array(random.sample(range(m), n_qtl))
+        reqtl = np.setdiff1d(range(m), qtl)
+        A_mark = tcrossprod(W[:, reqtl], W[:, reqtl]) / np.sum(2 * p[reqtl] * (1 - p[reqtl]))
+        A_qtl = tcrossprod(W[:, qtl], W[:, qtl]) / np.sum(2 * p[qtl] * (1 - p[qtl]))
+        x = A_mark - np.mean(np.diag(A_mark)) * np.eye(n)
+        y = A_qtl - np.mean(np.diag(A_qtl)) * np.eye(n)
+        return 1 - np.cov(y.flatten(), x.flatten())[0, 1] / np.var(x.flatten(), ddof=1)
+
+    def cov_W_shrink(W):
+        n = W.shape[0]
+        m = W.shape[1]
+        Z = np.transpose(StandardScaler(with_std=False).fit_transform(np.transpose(W)))
+        Z2 = Z ** 2
+        S = tcrossprod(Z, Z) / m
+        target = np.mean(np.diag(S)) * np.eye(n)
+        var_S = tcrossprod(Z2, Z2) / (m * m) - (S * S) / m
+        b2 = np.sum(var_S)
+        d2 = np.sum((S - target) ** 2)
+        delta = max(0, min(1, b2 / d2))
+        print("Shrinkage intensity:", format(delta, '.2f'))
+        return target * delta + (1 - delta) * S
+
+    # Handle missing values based on the imputation method
+    if np.isnan(X).any():
+        if impute_method == "mean":
+            col_mean = np.nanmean(X, axis=0)
+            inds = np.where(np.isnan(X))
+            X[inds] = np.take(col_mean, inds[1])
+        elif impute_method == "EM":
+            mean_vec = np.nanmean(X, axis=0)
+            cov_mat = np.cov(X, rowvar=False)
+            S, X = impute_EM(X, cov_mat, mean_vec)
+
+    # Standardize the genotype matrix (mean-center the matrix without scaling by std)
+    X_standardized = StandardScaler(with_mean=True, with_std=False).fit_transform(X)
+    
+    # Compute the additive relationship matrix (A.mat)
+    n, m = X_standardized.shape
+    A = tcrossprod(X_standardized, X_standardized) / m
+
+    # Apply shrinkage if requested
+    if shrink:
+        if shrink == "EJ" or shrink is True:
+            W_mean = np.mean(X_standardized, axis=1)
+            cov_W = cov_W_shrink(X_standardized)
+            A = (cov_W + tcrossprod(W_mean, W_mean)) / np.var(X_standardized, ddof=1)
+        elif shrink == "REG":
+            delta = np.mean([shrink_coeff(i, X_standardized, n_qtl, np.mean(X_standardized, axis=0)) for i in range(n_iter)])
+            print("Shrinkage intensity:", format(delta, ".2f"))
+            A = tcrossprod(X_standardized, X_standardized) / m
+            A = (1 - delta) * A + delta * np.mean(np.diag(A)) * np.eye(n)
+
+    if return_imputed:
+        return A, X
+    else:
+        return A
 
 import random
 import numpy as np
